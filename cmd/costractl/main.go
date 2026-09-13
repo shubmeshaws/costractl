@@ -1,9 +1,21 @@
 package main
 
 import (
+	"context"
 	"flag"
 	"fmt"
 	"os"
+	"time"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/clientcmd"
+
+	"github.com/shubmeshaws/costractl/internal/api"
+	"github.com/shubmeshaws/costractl/internal/deploy"
+	"github.com/shubmeshaws/costractl/internal/prompt"
+	"github.com/shubmeshaws/costractl/internal/region"
+	"github.com/shubmeshaws/costractl/internal/tiers"
 )
 
 var version = "dev" // overridden at build time via -ldflags
@@ -15,55 +27,208 @@ func main() {
 	}
 
 	switch os.Args[1] {
-	case "--version", "-v":
-		fmt.Printf("costractl version %s\n", version)
 	case "cluster":
-		handleClusterCommand(os.Args[2:])
+		if len(os.Args) < 3 {
+			printUsage()
+			os.Exit(1)
+		}
+		switch os.Args[2] {
+		case "connect":
+			if err := runConnect(os.Args[3:]); err != nil {
+				fmt.Fprintf(os.Stderr, "\n✗ %v\n", err)
+				os.Exit(1)
+			}
+		default:
+			printUsage()
+			os.Exit(1)
+		}
+	case "version", "--version", "-v":
+		fmt.Printf("costractl version %s\n", version)
 	default:
 		printUsage()
 		os.Exit(1)
 	}
 }
 
-func handleClusterCommand(args []string) {
-	if len(args) < 1 || args[0] != "connect" {
-		fmt.Println("Usage: costractl cluster connect --api-token=<token> --organization-id=<id>")
-		os.Exit(1)
-	}
+func printUsage() {
+	fmt.Println(`costractl — connect Kubernetes clusters to Costra
 
-	fs := flag.NewFlagSet("connect", flag.ExitOnError)
-	apiToken := fs.String("api-token", "", "API token from your Costra dashboard")
-	orgID := fs.String("organization-id", "", "Your organization UUID")
-	apiRegion := fs.String("api-region", "us", "API region")
-	clusterOptimization := fs.Bool("cluster-optimization", false, "Enable cluster optimization (requires AWS IAM role)")
-	workloadAutoscaler := fs.Bool("workload-autoscaler", false, "Enable workload autoscaler (requires write RBAC)")
-	fs.Parse(args[1:])
+Usage:
+  costractl cluster connect \
+    --api-token=<costra_v1_...> \
+    --organization-id=<uuid> \
+    [--api-region=us] \
+    [--api-url=<https://host>] \
+    [--context=<kube-context>] \
+    [--cluster-name=<name>] \
+    [--cost-monitoring=true] \
+    [--cluster-optimization=false] \
+    [--workload-autoscaler=false] \
+    [--yes]
 
-	if *apiToken == "" || *orgID == "" {
-		fmt.Println("Error: --api-token and --organization-id are required")
-		os.Exit(1)
-	}
+Install:
+  curl -fsSL https://get.costraai.com/macos | bash
+  curl -fsSL https://get.costraai.com/linux | bash
 
-	fmt.Printf("Connecting cluster to Costra (region: %s, org: %s)...\n", *apiRegion, *orgID)
-	fmt.Println("Reading current kubectl context...")
-	// TODO: use client-go's clientcmd to read the active context here,
-	// confirm with the user, then apply the read-only Helm chart.
-
-	if *clusterOptimization {
-		fmt.Println("Cluster optimization requested — this requires a cross-account AWS IAM role.")
-		fmt.Println("See: https://get.costraai.com/docs/cloud-permissions")
-	}
-	if *workloadAutoscaler {
-		fmt.Println("Workload autoscaler requested — installing write-permission RBAC (separate ClusterRole).")
-	}
-
-	fmt.Println("Cost-monitoring agent install: not yet implemented in this stub.")
+Run where kubectl context points at the cluster you want to connect.`)
 }
 
-func printUsage() {
-	fmt.Println("costractl — connect your infrastructure to Costra")
+func runConnect(args []string) error {
+	fs := flag.NewFlagSet("connect", flag.ExitOnError)
+	apiToken := fs.String("api-token", "", "Costra API token (costra_v1_...)")
+	apiURL := fs.String("api-url", "", "API base URL (overrides --api-region)")
+	apiRegion := fs.String("api-region", "us", "API region: us, eu")
+	orgID := fs.String("organization-id", "", "Organization UUID")
+	kubeContext := fs.String("context", "", "Kubeconfig context (default: current)")
+	clusterName := fs.String("cluster-name", "", "Display name (default: context name)")
+	costMonitoring := fs.Bool("cost-monitoring", true, "Tier 1: read-only cost monitoring (always recommended)")
+	clusterOptimization := fs.Bool("cluster-optimization", false, "Tier 2: cluster optimization (requires AWS IAM role)")
+	workloadAutoscaler := fs.Bool("workload-autoscaler", false, "Tier 3: workload autoscaler (requires write K8s RBAC)")
+	skipConfirm := fs.Bool("yes", false, "Skip cluster confirmation prompt")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *apiToken == "" || *orgID == "" {
+		return fmt.Errorf("--api-token and --organization-id are required")
+	}
+
+	baseURL := region.Resolve(*apiURL, *apiRegion)
+	client := api.New(baseURL, *apiToken, *orgID)
+
+	fmt.Println("→ Validating API token...")
+	validation, err := client.ValidateToken(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  ✓ Token valid for organization: %s\n", validation.OrganizationName)
+
+	if err := tiers.HandlePremiumFlags(*clusterOptimization, *workloadAutoscaler); err != nil {
+		return err
+	}
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	if *kubeContext != "" {
+		configOverrides.CurrentContext = *kubeContext
+	}
+
+	rawConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).RawConfig()
+	if err != nil {
+		return fmt.Errorf("read kubeconfig: %w", err)
+	}
+
+	ctxName := *kubeContext
+	if ctxName == "" {
+		ctxName = rawConfig.CurrentContext
+	}
+
+	name := *clusterName
+	if name == "" {
+		name = ctxName
+	}
+
+	serverURL := ""
+	if ctx, ok := rawConfig.Contexts[ctxName]; ok && ctx != nil {
+		if cluster, ok := rawConfig.Clusters[ctx.Cluster]; ok && cluster != nil {
+			serverURL = cluster.Server
+		}
+	}
+
+	if !*skipConfirm {
+		ok, err := prompt.ConfirmCluster(ctxName, name, serverURL)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("  Aborted.")
+			return nil
+		}
+	}
+
+	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
+	if err != nil {
+		return fmt.Errorf("load kubeconfig: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("kubernetes client: %w", err)
+	}
+
+	fmt.Printf("\n→ Connecting cluster \"%s\" (context: %s)\n", name, ctxName)
+
+	bundle, err := client.Connect(context.Background(), api.ConnectOptions{
+		ClusterName:         name,
+		KubeContext:         ctxName,
+		CostMonitoring:      *costMonitoring,
+		ClusterOptimization: *clusterOptimization,
+		WorkloadAutoscaler:  *workloadAutoscaler,
+	})
+	if err != nil {
+		return err
+	}
+
+	fmt.Println("→ Installing Tier 1 read-only collector agent (DaemonSet on every node, namespace: costra-agent)...")
+	if err := deploy.Install(context.Background(), clientset, deploy.Config{
+		Namespace:   bundle.Namespace,
+		ClusterID:   bundle.ClusterID,
+		ClusterName: bundle.ClusterName,
+		AgentToken:  bundle.AgentToken,
+		IngestURL:   bundle.IngestURL,
+		AgentImage:  bundle.AgentImage,
+	}); err != nil {
+		return fmt.Errorf("deploy agent: %w", err)
+	}
+
+	fmt.Println("→ Waiting for agent DaemonSet pods to become ready...")
+	ready := waitForDaemonSet(context.Background(), clientset, bundle.Namespace, "costra-collector", 3*time.Minute)
+
+	printSummary(bundle, validation.PermissionsDocURL, ready)
+	return nil
+}
+
+func printSummary(bundle *api.ConnectBundle, permissionsURL string, ready bool) {
 	fmt.Println()
-	fmt.Println("Usage:")
-	fmt.Println("  costractl --version")
-	fmt.Println("  costractl cluster connect --api-token=<token> --organization-id=<id>")
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Println("  Connection summary")
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Printf("  Cluster ID:   %s\n", bundle.ClusterID)
+	fmt.Printf("  Cluster name: %s\n", bundle.ClusterName)
+	fmt.Println()
+	fmt.Println("  Installed:")
+	fmt.Println("    ✓ Tier 1 — Cost monitoring (read-only K8s RBAC)")
+	fmt.Println("      Namespace: costra-agent")
+	fmt.Println("      Model: DaemonSet on every node")
+	fmt.Println("      Permissions: get, list, watch on nodes, pods, workloads")
+	if len(bundle.TiersPending) > 0 {
+		fmt.Println()
+		fmt.Println("  Requested (pending — not installed yet):")
+		for _, t := range bundle.TiersPending {
+			fmt.Printf("    ○ %s\n", t)
+		}
+	}
+	fmt.Println()
+	if ready {
+		fmt.Println("  Status: Agents are running on all nodes. Metrics appear in ~5 minutes.")
+	} else {
+		fmt.Println("  Status: DaemonSet deployed — check: kubectl get daemonset -n costra-agent")
+	}
+	if permissionsURL != "" {
+		fmt.Println()
+		fmt.Printf("  Cloud permissions details: %s\n", permissionsURL)
+	}
+	fmt.Println("═══════════════════════════════════════════════════════")
+}
+
+func waitForDaemonSet(ctx context.Context, c kubernetes.Interface, ns, name string, timeout time.Duration) bool {
+	deadline := time.Now().Add(timeout)
+	for time.Now().Before(deadline) {
+		ds, err := c.AppsV1().DaemonSets(ns).Get(ctx, name, metav1.GetOptions{})
+		if err == nil && ds.Status.DesiredNumberScheduled > 0 && ds.Status.NumberReady >= ds.Status.DesiredNumberScheduled {
+			return true
+		}
+		time.Sleep(5 * time.Second)
+	}
+	return false
 }
