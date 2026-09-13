@@ -133,3 +133,39 @@ func (c *Client) Connect(ctx context.Context, opts ConnectOptions) (*ConnectBund
 	}
 	return &envelope.Data, nil
 }
+
+type DisconnectResult struct {
+	ClusterID   string `json:"clusterId"`
+	ClusterName string `json:"clusterName"`
+	Namespace   string `json:"namespace"`
+}
+
+func (c *Client) Disconnect(ctx context.Context, clusterName string) (*DisconnectResult, error) {
+	body := map[string]interface{}{
+		"clusterName": clusterName,
+	}
+	raw, _ := json.Marshal(body)
+
+	resp, err := c.authRequest(ctx, http.MethodPost, "/api/collector/disconnect", raw)
+	if err != nil {
+		return nil, fmt.Errorf("disconnect request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	b, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if resp.StatusCode == 404 {
+		return nil, fmt.Errorf("cluster \"%s\" not found in Costra — it may already be disconnected", clusterName)
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("disconnect failed (%d): %s", resp.StatusCode, string(b))
+	}
+
+	var envelope struct {
+		Success bool             `json:"success"`
+		Data    DisconnectResult `json:"data"`
+	}
+	if err := json.Unmarshal(b, &envelope); err != nil {
+		return nil, err
+	}
+	return &envelope.Data, nil
+}

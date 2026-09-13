@@ -38,6 +38,11 @@ func main() {
 				fmt.Fprintf(os.Stderr, "\n✗ %v\n", err)
 				os.Exit(1)
 			}
+		case "disconnect":
+			if err := runDisconnect(os.Args[3:]); err != nil {
+				fmt.Fprintf(os.Stderr, "\n✗ %v\n", err)
+				os.Exit(1)
+			}
 		default:
 			printUsage()
 			os.Exit(1)
@@ -64,6 +69,16 @@ Usage:
     [--cost-monitoring=true] \
     [--cluster-optimization=false] \
     [--workload-autoscaler=false] \
+    [--yes]
+
+  costractl cluster disconnect \
+    --api-token=<costra_v1_...> \
+    --organization-id=<uuid> \
+    [--api-region=us] \
+    [--api-url=<https://host>] \
+    [--context=<kube-context>] \
+    [--cluster-name=<name>] \
+    [--delete-namespace] \
     [--yes]
 
 Install:
@@ -185,6 +200,130 @@ func runConnect(args []string) error {
 	ready := waitForDaemonSet(context.Background(), clientset, bundle.Namespace, "costra-collector", 3*time.Minute)
 
 	printSummary(bundle, validation.PermissionsDocURL, ready)
+	return nil
+}
+
+func runDisconnect(args []string) error {
+	fs := flag.NewFlagSet("disconnect", flag.ExitOnError)
+	apiToken := fs.String("api-token", "", "Costra API token (costra_v1_...)")
+	apiURL := fs.String("api-url", "", "API base URL (overrides --api-region)")
+	apiRegion := fs.String("api-region", "us", "API region: us, eu")
+	orgID := fs.String("organization-id", "", "Organization UUID")
+	kubeContext := fs.String("context", "", "Kubeconfig context (default: current)")
+	clusterName := fs.String("cluster-name", "", "Cluster name in Costra (default: context name)")
+	deleteNamespace := fs.Bool("delete-namespace", false, "Delete the costra-agent namespace entirely")
+	skipConfirm := fs.Bool("yes", false, "Skip confirmation prompt")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if *apiToken == "" || *orgID == "" {
+		return fmt.Errorf("--api-token and --organization-id are required")
+	}
+
+	baseURL := region.Resolve(*apiURL, *apiRegion)
+	client := api.New(baseURL, *apiToken, *orgID)
+
+	fmt.Println("→ Validating API token...")
+	validation, err := client.ValidateToken(context.Background())
+	if err != nil {
+		return err
+	}
+	fmt.Printf("  ✓ Token valid for organization: %s\n", validation.OrganizationName)
+
+	loadingRules := clientcmd.NewDefaultClientConfigLoadingRules()
+	configOverrides := &clientcmd.ConfigOverrides{}
+	if *kubeContext != "" {
+		configOverrides.CurrentContext = *kubeContext
+	}
+
+	rawConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).RawConfig()
+	if err != nil {
+		return fmt.Errorf("read kubeconfig: %w", err)
+	}
+
+	ctxName := *kubeContext
+	if ctxName == "" {
+		ctxName = rawConfig.CurrentContext
+	}
+
+	name := *clusterName
+	if name == "" {
+		name = ctxName
+	}
+
+	serverURL := ""
+	if ctx, ok := rawConfig.Contexts[ctxName]; ok && ctx != nil {
+		if cluster, ok := rawConfig.Clusters[ctx.Cluster]; ok && cluster != nil {
+			serverURL = cluster.Server
+		}
+	}
+
+	if !*skipConfirm {
+		ok, err := prompt.ConfirmDisconnect(ctxName, name, serverURL)
+		if err != nil {
+			return err
+		}
+		if !ok {
+			fmt.Println("  Aborted.")
+			return nil
+		}
+	}
+
+	kubeConfig, err := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(loadingRules, configOverrides).ClientConfig()
+	if err != nil {
+		return fmt.Errorf("load kubeconfig: %w", err)
+	}
+	clientset, err := kubernetes.NewForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("kubernetes client: %w", err)
+	}
+
+	fmt.Printf("\n→ Disconnecting cluster \"%s\" (context: %s)\n", name, ctxName)
+
+	var apiErr error
+	result, apiErr := client.Disconnect(context.Background(), name)
+	if apiErr != nil {
+		fmt.Printf("  ⚠ Costra API: %v\n", apiErr)
+	} else {
+		fmt.Printf("  ✓ Cluster registration revoked in Costra (id: %s)\n", result.ClusterID)
+	}
+
+	namespace := "costra-agent"
+	if result != nil && result.Namespace != "" {
+		namespace = result.Namespace
+	}
+
+	fmt.Println("→ Removing collector agent from Kubernetes...")
+	if err := deploy.Uninstall(context.Background(), clientset, deploy.UninstallOptions{
+		Namespace:       namespace,
+		DeleteNamespace: *deleteNamespace,
+	}); err != nil {
+		return fmt.Errorf("remove agent: %w", err)
+	}
+	fmt.Println("  ✓ DaemonSet, credentials, and RBAC removed")
+
+	if *deleteNamespace {
+		fmt.Printf("  ✓ Namespace %s deleted\n", namespace)
+	}
+
+	fmt.Println()
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Println("  Disconnect summary")
+	fmt.Println("═══════════════════════════════════════════════════════")
+	fmt.Printf("  Cluster name: %s\n", name)
+	if apiErr == nil {
+		fmt.Println("  Costra:       Registration revoked")
+	} else {
+		fmt.Println("  Costra:       API revoke failed — check cluster name or run again")
+	}
+	fmt.Println("  Kubernetes:   Collector agent removed")
+	fmt.Println("═══════════════════════════════════════════════════════")
+
+	if apiErr != nil {
+		return apiErr
+	}
 	return nil
 }
 

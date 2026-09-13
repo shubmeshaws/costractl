@@ -26,6 +26,34 @@ type Config struct {
 	AgentImage  string
 }
 
+type UninstallOptions struct {
+	Namespace       string
+	DeleteNamespace bool
+}
+
+func Uninstall(ctx context.Context, clientset kubernetes.Interface, opts UninstallOptions) error {
+	ns := opts.Namespace
+	if ns == "" {
+		ns = "costra-agent"
+	}
+
+	propagation := metav1.DeletePropagationForeground
+	deleteOpts := metav1.DeleteOptions{PropagationPolicy: &propagation}
+
+	_ = clientset.AppsV1().DaemonSets(ns).Delete(ctx, releaseName, deleteOpts)
+	_ = clientset.AppsV1().Deployments(ns).Delete(ctx, releaseName, deleteOpts)
+	_ = clientset.CoreV1().Secrets(ns).Delete(ctx, "costra-collector-credentials", deleteOpts)
+	_ = clientset.CoreV1().ServiceAccounts(ns).Delete(ctx, saName, deleteOpts)
+	_ = clientset.RbacV1().ClusterRoleBindings().Delete(ctx, releaseName, deleteOpts)
+	_ = clientset.RbacV1().ClusterRoles().Delete(ctx, releaseName, deleteOpts)
+
+	if opts.DeleteNamespace {
+		_ = clientset.CoreV1().Namespaces().Delete(ctx, ns, deleteOpts)
+	}
+
+	return nil
+}
+
 func Install(ctx context.Context, clientset kubernetes.Interface, cfg Config) error {
 	ns := cfg.Namespace
 	if ns == "" {
